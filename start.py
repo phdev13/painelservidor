@@ -9,6 +9,12 @@ from PySide6.QtGui import QPixmap
 import re
 import traceback
 import shutil
+import time
+
+# Adiciona no início do arquivo, logo após os imports
+if sys.platform.startswith('win'):
+    import ctypes
+    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # Tema escuro moderno
 THEME = {
@@ -141,6 +147,44 @@ class ServerThread(QThread):
         
     def stop(self):
         self.running = False
+
+class ShutdownThread(QThread):
+    finished = Signal()
+    
+    def __init__(self, server_process):
+        super().__init__()
+        self.server_process = server_process
+    
+    def run(self):
+        try:
+            # Try graceful shutdown first
+            if self.server_process and self.server_process.poll() is None:
+                self.server_process.stdin.write("stop\n")
+                self.server_process.stdin.flush()
+                
+                # Wait for up to 10 seconds
+                for _ in range(20):
+                    if self.server_process.poll() is not None:
+                        break
+                    time.sleep(0.5)
+                    
+                # Force kill if still running
+                if self.server_process.poll() is None:
+                    self.server_process.kill()
+                
+            # Clean up resources
+            if self.server_process:
+                try:
+                    self.server_process.stdout.close()
+                    self.server_process.stderr.close()
+                    self.server_process.stdin.close()
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error in shutdown thread: {e}")
+        finally:
+            self.finished.emit()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -334,7 +378,7 @@ class MainWindow(QMainWindow):
             ("Logo do Servidor", "server-logo", "logo")  # Novo tipo de campo
         ])
 
-        self.add_config_card(scroll_layout, "Configurações Básicas", [
+        self.add_config_card(scroll_layout, "Configurações Báaaasicas", [
             ("IP do Servidor", "server-ip", "text"),
             ("Nome do Servidor", "server-name", "text"),
             ("MOTD", "motd", "text"),
@@ -569,9 +613,13 @@ class MainWindow(QMainWindow):
             if not server_jar_path or not os.path.exists(server_jar_path):
                 raise FileNotFoundError("❌ Arquivo server.jar não encontrado!")
 
-            # Tenta iniciar o servidor
+            # Inicia servidor sem mostrar CMD
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            # Comando do servidor
             command = f"java -Xmx1G -Xms1G -Dfile.encoding=UTF8 -jar \"{server_jar_path}\" nogui"
-            self.log_message(f"Executando comando: {command}", "info")
             
             process = subprocess.Popen(
                 command,
@@ -582,9 +630,11 @@ class MainWindow(QMainWindow):
                 cwd=self.script_dir,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
-            
+
             # Verifica se o processo iniciou
             if not process or process.poll() is not None:
                 raise RuntimeError("❌ Falha ao iniciar o processo do servidor")
@@ -624,22 +674,48 @@ class MainWindow(QMainWindow):
 
     def stop_server(self):
         global server_running, server_process
-        if self.server_thread:
-            self.server_thread.stop()
-        if server_process:
-            try:
-                self.send_command("stop")
-                server_process.wait(timeout=10)
-            except:
-                self.kill_server()
+        if not server_process:
+            self.reset_server_state()
+            return
+            
+        # Disable controls during shutdown
+        self.toggle_btn.setEnabled(False)
+        self.restart_btn.setEnabled(False)
+        self.kill_btn.setEnabled(False)
+        self.config_btn.setEnabled(False)
+        
+        # Start shutdown in background thread
+        self.shutdown_thread = ShutdownThread(server_process)
+        self.shutdown_thread.finished.connect(self.on_shutdown_complete)
+        self.shutdown_thread.start()
+        
+        self.log_message("🔄 Desligando servidor...", "warn")
+
+    def on_shutdown_complete(self):
         self.reset_server_state()
         self.log_message("🔴 Servidor parado.")
+        
+        # Re-enable controls
+        self.toggle_btn.setEnabled(True)
+        self.config_btn.setEnabled(True)
 
     def kill_server(self):
         global server_running, server_process
         if server_process:
-            server_process.kill()
-            server_process = None
+            try:
+                # Força finalização do processo
+                server_process.kill()
+                
+                # Limpa recursos
+                server_process.stdout.close()
+                server_process.stderr.close() 
+                server_process.stdin.close()
+                
+            except:
+                pass
+            finally:
+                server_process = None
+                
         self.reset_server_state()
         self.log_message("🔴 Servidor finalizado (kill).")
 
